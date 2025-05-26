@@ -1,13 +1,14 @@
 import torch
 import torch.nn as nn # Diperlukan untuk fallback jika L4QQuantized* tidak ditemukan
 
-# Impor layer L4Q dasar Anda
+# --- Impor layer L4Q dasar Anda menggunakan impor relatif ---
 try:
     from .l4q_linear_layer import L4QQuantizedLinear
     from .l4q_conv2d_layer import L4QQuantizedConv2d
-except ImportError:
-    print("PERINGATAN KRITIKAL di l4q_utils.py: Gagal mengimpor L4QQuantizedLinear/Conv2d. Fungsi helper L4Q akan fallback ke nn.Linear/Conv2d.")
-    # Fallback jika layer L4Q dasar tidak ditemukan (ini seharusnya tidak terjadi jika file ada)
+    print("DEBUG l4q_utils.py: Berhasil mengimpor L4QQuantizedLinear dan L4QQuantizedConv2d.")
+except ImportError as e:
+    print(f"PERINGATAN KRITIKAL di l4q_utils.py: Gagal mengimpor L4QQuantizedLinear/Conv2d dari .l4q_linear_layer atau .l4q_conv2d_layer. Error: {e}. Fungsi helper L4Q akan fallback ke nn.Linear/Conv2d.")
+    # Fallback jika layer L4Q dasar tidak ditemukan
     L4QQuantizedLinear = nn.Linear 
     L4QQuantizedConv2d = nn.Conv2d
 
@@ -49,10 +50,15 @@ def l4q_init_scale(weight_tensor: torch.Tensor, n_bits: int, group_size: int = -
         return torch.tensor(current_scale, device=weight_tensor.device, dtype=weight_tensor.dtype)
     else: # Group-wise quantization
         if weight_tensor.numel() % group_size != 0:
-            raise ValueError(f"Ukuran tensor bobot ({weight_tensor.numel()}) harus dapat dibagi habis oleh group_size ({group_size}).")
+            # Jika tidak bisa dibagi habis, mungkin fallback ke per-tensor atau error.
+            # Untuk sekarang, kita bisa coba fallback ke per-tensor untuk grup ini jika sangat kecil.
+            # Atau, lebih baik raise error agar pengguna sadar.
+            print(f"PERINGATAN: Ukuran tensor bobot ({weight_tensor.numel()}) tidak dapat dibagi habis oleh group_size ({group_size}). Menggunakan per-tensor untuk bobot ini.")
+            return l4q_init_scale(weight_tensor, n_bits, group_size=-1) # Fallback
+            # raise ValueError(f"Ukuran tensor bobot ({weight_tensor.numel()}) harus dapat dibagi habis oleh group_size ({group_size}).")
         
         num_groups = weight_tensor.numel() // group_size
-        weight_groups = weight_tensor.reshape(num_groups, group_size) # Menggunakan reshape
+        weight_groups = weight_tensor.reshape(num_groups, group_size)
         
         scales = torch.zeros(num_groups, device=weight_tensor.device, dtype=weight_tensor.dtype)
         
@@ -77,45 +83,38 @@ def l4q_init_scale(weight_tensor: torch.Tensor, n_bits: int, group_size: int = -
                 current_scale_group = 1e-9
             scales[i] = current_scale_group
             
-        # Untuk group-wise, q_scale di L4QQuantizedLinear/Conv2d biasanya diharapkan [num_groups]
-        # atau [num_groups, 1] jika broadcasting diurus di sana.
-        # l4q_init_scale di paper L4Q tidak secara eksplisit menyebut shape output untuk group-wise.
-        # Mari kita kembalikan sebagai [num_groups] untuk konsistensi dengan Parameter.
-        return scales # Shape [num_groups]
+        return scales
 
-# --- Fungsi Helper L4Q (DIPINDAHKAN KE SINI) ---
+# --- Fungsi Helper L4Q ---
 def make_l4q_linear(in_features, out_features, bias=True, 
                     lora_rank=4, n_bits=4, alpha=1.0, group_size=-1,
-                    l4q_enabled_passed=True # Flag tambahan untuk kontrol eksternal jika diperlukan
+                    l4q_enabled_passed=True 
                     ):
     """Helper function to create L4QQuantizedLinear layer or fallback to nn.Linear."""
-    if l4q_enabled_passed and L4QQuantizedLinear != nn.Linear : # Cek juga fallback L4QQuantizedLinear
-        # print(f"DEBUG: Membuat L4QQuantizedLinear ({in_features}, {out_features})")
+    if l4q_enabled_passed and L4QQuantizedLinear != nn.Linear :
+        # print(f"DEBUG l4q_utils: Membuat L4QQuantizedLinear ({in_features}, {out_features})")
         return L4QQuantizedLinear(
             in_features, out_features, bias=bias,
             lora_rank=lora_rank, n_bits=n_bits, alpha=alpha, 
             group_size=group_size
         )
     else:
-        # print(f"DEBUG: Fallback ke nn.Linear ({in_features}, {out_features})")
+        # print(f"DEBUG l4q_utils: Fallback ke nn.Linear ({in_features}, {out_features})")
         return nn.Linear(in_features, out_features, bias=bias)
 
-def make_l4q_conv2d(dims, # Tambahkan dims untuk kompatibilitas dengan conv_nd OpenAI
+def make_l4q_conv2d(dims, 
                     in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, groups=1, bias=True,
                     lora_rank=4, n_bits=4, alpha=1.0, quant_group_size=-1,
-                    l4q_enabled_passed=True # Flag tambahan
+                    l4q_enabled_passed=True
                     ):
     """Helper function to create L4QQuantizedConv2d layer or fallback to nn.ConvXd."""
-    # Parameter 'dims' dari conv_nd OpenAI tidak secara langsung dipakai oleh L4QQuantizedConv2d
-    # karena L4QQuantizedConv2d kita asumsikan 2D.
-    # Jika Anda perlu mendukung conv1d/3d L4Q, Anda perlu implementasi terpisah.
     if dims != 2 and l4q_enabled_passed and L4QQuantizedConv2d != nn.Conv2d:
-        print(f"PERINGATAN: make_l4q_conv2d dipanggil dengan dims={dims} tapi hanya mendukung dims=2 untuk L4Q. Fallback ke nn.Conv{dims}d.")
-        l4q_enabled_passed = False # Force fallback
+        print(f"PERINGATAN l4q_utils: make_l4q_conv2d dipanggil dengan dims={dims} tapi hanya mendukung dims=2 untuk L4Q. Fallback ke nn.Conv{dims}d.")
+        l4q_enabled_passed = False 
 
     if l4q_enabled_passed and L4QQuantizedConv2d != nn.Conv2d:
-        # print(f"DEBUG: Membuat L4QQuantizedConv2d ({in_channels}, {out_channels}, k={kernel_size})")
-        if isinstance(kernel_size, int): # Pastikan kernel_size adalah tuple untuk L4QQuantizedConv2d
+        # print(f"DEBUG l4q_utils: Membuat L4QQuantizedConv2d ({in_channels}, {out_channels}, k={kernel_size})")
+        if isinstance(kernel_size, int): 
             kernel_size_tuple = (kernel_size, kernel_size)
         else:
             kernel_size_tuple = kernel_size
@@ -125,7 +124,7 @@ def make_l4q_conv2d(dims, # Tambahkan dims untuk kompatibilitas dengan conv_nd O
             quant_group_size=quant_group_size
         )
     else:
-        # print(f"DEBUG: Fallback ke nn.Conv{dims}d ({in_channels}, {out_channels}, k={kernel_size})")
+        # print(f"DEBUG l4q_utils: Fallback ke nn.Conv{dims}d ({in_channels}, {out_channels}, k={kernel_size})")
         if dims == 1:
             return nn.Conv1d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, dilation=dilation, groups=groups, bias=bias)
         elif dims == 2:
