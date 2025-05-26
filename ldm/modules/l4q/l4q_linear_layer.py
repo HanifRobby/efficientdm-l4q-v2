@@ -6,68 +6,56 @@ import math
 
 from .l4q_quant_core import l4q_init_scale, get_quantization_bounds 
 
-# Variabel global DTYPE untuk check_tensor_grad (sesuaikan jika perlu)
-# Ini harus sama dengan DTYPE yang digunakan di verify_gradients.py (torch.double)
 GRADCHECK_DTYPE = torch.double
 
 def check_tensor_grad(grad_tensor, name="gradient", expected_dtype=GRADCHECK_DTYPE):
-    """Helper untuk memeriksa validitas sebuah tensor gradien."""
     if grad_tensor is None:
-        print(f"  DEBUG GRAD: {name}: None (OK jika input tidak memerlukan gradien atau bukan tensor)")
+        print(f"  DEBUG GRAD: {name}: None (OK)")
         return True
     if not isinstance(grad_tensor, torch.Tensor):
         print(f"  DEBUG GRAD ERROR: {name}: Bukan Tensor! Tipe: {type(grad_tensor)}")
         return False
-    
     valid = True
-    print(f"  DEBUG GRAD: {name}: shape={grad_tensor.shape}, dtype={grad_tensor.dtype}, device={grad_tensor.device}")
-    if torch.isnan(grad_tensor).any():
-        print(f"  DEBUG GRAD WARNING: {name} mengandung NaN!")
-        valid = False
-    if torch.isinf(grad_tensor).any():
-        print(f"  DEBUG GRAD WARNING: {name} mengandung Inf!")
-        valid = False
-    if grad_tensor.dtype != expected_dtype:
-        print(f"  DEBUG GRAD WARNING: {name} dtype ({grad_tensor.dtype}) tidak cocok dengan input dtype ({expected_dtype})!")
-        # valid = False # gradcheck bisa menangani ini, tapi baik untuk diketahui
+    print(f"  DEBUG GRAD: {name}: shape={grad_tensor.shape}, dtype={grad_tensor.dtype}, device={grad_tensor.device}, requires_grad={grad_tensor.requires_grad}")
+    if torch.isnan(grad_tensor).any(): print(f"  DEBUG GRAD WARNING: {name} mengandung NaN!"); valid = False
+    if torch.isinf(grad_tensor).any(): print(f"  DEBUG GRAD WARNING: {name} mengandung Inf!"); valid = False
+    if grad_tensor.dtype != expected_dtype: print(f"  DEBUG GRAD WARNING: {name} dtype ({grad_tensor.dtype}) tidak cocok ({expected_dtype})!")
     return valid
 
 class L4QQuantizedLinearFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, w0, lora_a, lora_b, alpha, n_bits, q_scale, group_size):
+        # ... (Kode forward Anda yang sudah ada, pastikan effective_group_size_fwd dihitung dengan benar) ...
         w_lora = alpha * (lora_b @ lora_a) 
         w_comb = w0 + w_lora 
 
-        # Tentukan effective_group_size untuk operasi aktual
         effective_group_size_fwd = group_size
         if group_size != -1:
             if w_comb.numel() == 0 or w_comb.numel() < group_size or w_comb.numel() % group_size != 0:
-                # print(f"L4QLinearFunction.forward INFO: Fallback ke per-tensor untuk w_comb shape {w_comb.shape} dan group_size {group_size}")
                 effective_group_size_fwd = -1 
+
+        w_scaled_grouped = None 
+        w_scaled = None       
 
         if effective_group_size_fwd != -1:
             original_shape = w_comb.shape
             num_groups_w = w_comb.numel() // effective_group_size_fwd
             w_comb_grouped = w_comb.reshape(num_groups_w, effective_group_size_fwd)
             
+            current_q_scale = q_scale
             if q_scale.numel() == num_groups_w:
-                scale_expanded = q_scale.unsqueeze(1) 
+                scale_expanded = current_q_scale.unsqueeze(1) 
             elif q_scale.numel() == 1: 
-                scale_expanded = q_scale 
+                scale_expanded = current_q_scale 
             else:
-                # Ini bisa terjadi jika q_scale diinisialisasi sebagai per-tensor karena fallback di __init__ L4QQuantizedLinear
-                # tapi group_size yang diteruskan ke apply() masih nilai group-wise asli.
-                # print(f"L4QLinearFunction.forward WARNING: Shape q_scale ({q_scale.shape}) tidak cocok ({num_groups_w} groups). Menggunakan q_scale sebagai per-tensor.")
-                scale_expanded = q_scale # Asumsikan q_scale adalah skalar (per-tensor)
-                effective_group_size_fwd = -1 # Paksa per-tensor jika q_scale tidak cocok
-                w_scaled = w_comb / (q_scale.item() + 1e-9) # Gunakan .item() jika q_scale skalar tensor
+                scale_expanded = current_q_scale 
+                effective_group_size_fwd = -1 
             
-            if effective_group_size_fwd != -1: # Cek ulang setelah potensi modifikasi
+            if effective_group_size_fwd != -1:
                  w_scaled_grouped = w_comb_grouped / (scale_expanded + 1e-9)
         
-        if effective_group_size_fwd == -1: # Jika akhirnya per-tensor
-            w_scaled = w_comb / (q_scale.item() + 1e-9) if q_scale.numel() == 1 else w_comb / (q_scale + 1e-9)
-
+        if effective_group_size_fwd == -1: 
+            w_scaled = w_comb / (q_scale + 1e-9) if q_scale.numel() > 1 else w_comb / (q_scale.item() + 1e-9)
 
         q_n, q_p = get_quantization_bounds(n_bits)
         
@@ -79,7 +67,7 @@ class L4QQuantizedLinearFunction(torch.autograd.Function):
             quantized_w_int_for_backward = quantized_w_int_grouped
         else:
             quantized_w_int = torch.round(torch.clamp(w_scaled, q_n, q_p))
-            w_q = quantized_w_int * (q_scale.item() if q_scale.numel() == 1 else q_scale)
+            w_q = quantized_w_int * (q_scale if q_scale.numel() > 1 else q_scale.item())
             w_scaled_for_ste = w_scaled
             quantized_w_int_for_backward = quantized_w_int
 
@@ -87,12 +75,10 @@ class L4QQuantizedLinearFunction(torch.autograd.Function):
         
         ctx.save_for_backward(x, w0, lora_a, lora_b, q_scale, w_q, quantized_w_int_for_backward, w_comb)
         ctx.alpha = alpha
-        # ctx.n_bits = n_bits # Tidak dipakai di backward
         ctx.q_n = q_n
         ctx.q_p = q_p
         ctx.w_scaled_for_ste = w_scaled_for_ste
-        ctx.effective_group_size_used_in_fwd = effective_group_size_fwd # Simpan group_size yang benar-benar dipakai
-
+        ctx.effective_group_size_used_in_fwd = effective_group_size_fwd
         return output
 
     @staticmethod
@@ -102,56 +88,60 @@ class L4QQuantizedLinearFunction(torch.autograd.Function):
         effective_group_size = ctx.effective_group_size_used_in_fwd 
         q_n = ctx.q_n
         q_p = ctx.q_p
-        w_scaled_for_ste = ctx.w_scaled_for_ste # Ini sudah grouped jika effective_group_size != -1
+        w_scaled_for_ste = ctx.w_scaled_for_ste
 
         grad_x = grad_w0 = grad_lora_a = grad_lora_b = grad_q_scale = None
         
-        if ctx.needs_input_grad[0]: 
-            grad_x = F.linear(grad_output, w_q.transpose(0, 1))
+        grad_output_dtype = grad_output.to(x.dtype)
 
-        grad_L_wrt_wq = grad_output.transpose(-2, -1) @ x 
-        if len(grad_L_wrt_wq.shape) > 2: 
-            grad_L_wrt_wq = grad_L_wrt_wq.sum(dim=0)
+        if ctx.needs_input_grad[0]: 
+            grad_x = F.linear(grad_output_dtype, w_q.transpose(0, 1).to(x.dtype))
+
+        grad_L_wrt_wq_intermediate = grad_output_dtype.transpose(-2, -1) @ x 
+        if len(grad_L_wrt_wq_intermediate.shape) > 2: 
+            grad_L_wrt_wq_intermediate = grad_L_wrt_wq_intermediate.sum(dim=0)
+        grad_L_wrt_wq = grad_L_wrt_wq_intermediate.to(w_q.dtype)
         
         if effective_group_size != -1:
-            # w_scaled_for_ste sudah dalam bentuk grouped [num_groups, group_size]
             ste_mask_grouped = (w_scaled_for_ste >= q_n) & (w_scaled_for_ste <= q_p)
-            ste_mask = ste_mask_grouped.reshape(w_comb.shape) # Reshape ke original weight shape
+            ste_mask = ste_mask_grouped.reshape(w_comb.shape)
         else:
-            # w_scaled_for_ste adalah [out_feat, in_feat]
             ste_mask = (w_scaled_for_ste >= q_n) & (w_scaled_for_ste <= q_p)
         
-        grad_L_wrt_wq_masked_by_ste = grad_L_wrt_wq * ste_mask
+        grad_L_wrt_wq_masked_by_ste = grad_L_wrt_wq * ste_mask.to(grad_L_wrt_wq.dtype)
 
-        if ctx.needs_input_grad[2]: # lora_a
+        if ctx.needs_input_grad[2]: 
             grad_lora_a = alpha * (lora_b.transpose(0,1) @ grad_L_wrt_wq_masked_by_ste)
-        if ctx.needs_input_grad[3]: # lora_b
+        if ctx.needs_input_grad[3]: 
             grad_lora_b = (grad_L_wrt_wq_masked_by_ste @ lora_a.transpose(0,1)) * alpha
         
         if ctx.needs_input_grad[6]: # q_scale
+            quantized_w_int_casted = quantized_w_int.to(grad_L_wrt_wq.dtype)
             if effective_group_size != -1:
                 num_groups_w = w_comb.numel() // effective_group_size
-                # quantized_w_int sudah grouped [num_groups, group_size]
-                # grad_L_wrt_wq perlu di-reshape agar sesuai untuk perkalian elemen-wise
                 grad_L_wrt_wq_grouped = grad_L_wrt_wq.reshape(num_groups_w, effective_group_size)
-                grad_q_scale_grouped = (grad_L_wrt_wq_grouped * quantized_w_int).sum(dim=1) 
-                grad_q_scale = grad_q_scale_grouped
-            else:
-                # quantized_w_int adalah [out_feat, in_feat]
-                grad_q_scale = (grad_L_wrt_wq * quantized_w_int).sum()
+                grad_q_scale_grouped = (grad_L_wrt_wq_grouped * quantized_w_int_casted).sum(dim=1) 
+                grad_q_scale = grad_q_scale_grouped.to(q_scale.dtype)
+            else: # Per-tensor
+                grad_q_scale_sum = (grad_L_wrt_wq * quantized_w_int_casted).sum()
+                # Pastikan grad_q_scale memiliki shape yang sama dengan q_scale input
+                if q_scale.numel() == 1 and q_scale.ndim == 1: # Jika q_scale adalah [1]
+                    grad_q_scale = grad_q_scale_sum.reshape(1).to(q_scale.dtype)
+                elif q_scale.numel() == 1 and q_scale.ndim == 0: # Jika q_scale adalah skalar (jarang terjadi jika Parameter)
+                     grad_q_scale = grad_q_scale_sum.to(q_scale.dtype)
+                else: # Kasus lain (seharusnya tidak terjadi jika q_scale per-tensor adalah [1])
+                    grad_q_scale = grad_q_scale_sum.to(q_scale.dtype) # Default ke skalar jika bingung
         
-        # --- BLOK DEBUG ---
-        # print("\n--- Debug Gradients L4QQuantizedLinearFunction.backward ---")
-        # check_tensor_grad(grad_x, "grad_x (linear)")
-        # print(f"  grad_w0 (linear): {grad_w0}") # Harusnya None
-        # check_tensor_grad(grad_lora_a, "grad_lora_a (linear)")
-        # check_tensor_grad(grad_lora_b, "grad_lora_b (linear)")
-        # check_tensor_grad(grad_q_scale, "grad_q_scale (linear)")
-        # print("--- Akhir Debug Gradients Linear ---")
+        print("\n--- Debug Gradients L4QQuantizedLinearFunction.backward ---")
+        check_tensor_grad(grad_x, "grad_x (linear)")
+        print(f"  DEBUG GRAD: grad_w0 (linear): {grad_w0}") 
+        check_tensor_grad(grad_lora_a, "grad_lora_a (linear)")
+        check_tensor_grad(grad_lora_b, "grad_lora_b (linear)")
+        check_tensor_grad(grad_q_scale, "grad_q_scale (linear)")
+        print("--- Akhir Debug Gradients Linear ---")
 
-        # Urutan return harus sesuai dengan urutan input forward:
-        # x, w0, lora_a, lora_b, alpha, n_bits, q_scale, group_size
         return grad_x, grad_w0, grad_lora_a, grad_lora_b, None, None, grad_q_scale, None
+
 
 class L4QQuantizedLinear(nn.Module):
     def __init__(self, in_features: int, out_features: int, 

@@ -6,28 +6,20 @@ import math
 
 from .l4q_quant_core import l4q_init_scale, get_quantization_bounds
 
-# Variabel global DTYPE untuk check_tensor_grad
 GRADCHECK_DTYPE = torch.double
 
 def check_tensor_grad(grad_tensor, name="gradient", expected_dtype=GRADCHECK_DTYPE):
-    """Helper untuk memeriksa validitas sebuah tensor gradien."""
     if grad_tensor is None:
-        print(f"  DEBUG GRAD: {name}: None (OK jika input tidak memerlukan gradien atau bukan tensor)")
+        print(f"  DEBUG GRAD: {name}: None (OK)")
         return True
     if not isinstance(grad_tensor, torch.Tensor):
         print(f"  DEBUG GRAD ERROR: {name}: Bukan Tensor! Tipe: {type(grad_tensor)}")
         return False
-    
     valid = True
-    print(f"  DEBUG GRAD: {name}: shape={grad_tensor.shape}, dtype={grad_tensor.dtype}, device={grad_tensor.device}")
-    if torch.isnan(grad_tensor).any():
-        print(f"  DEBUG GRAD WARNING: {name} mengandung NaN!")
-        valid = False
-    if torch.isinf(grad_tensor).any():
-        print(f"  DEBUG GRAD WARNING: {name} mengandung Inf!")
-        valid = False
-    if grad_tensor.dtype != expected_dtype:
-        print(f"  DEBUG GRAD WARNING: {name} dtype ({grad_tensor.dtype}) tidak cocok dengan input dtype ({expected_dtype})!")
+    print(f"  DEBUG GRAD: {name}: shape={grad_tensor.shape}, dtype={grad_tensor.dtype}, device={grad_tensor.device}, requires_grad={grad_tensor.requires_grad}")
+    if torch.isnan(grad_tensor).any(): print(f"  DEBUG GRAD WARNING: {name} mengandung NaN!"); valid = False
+    if torch.isinf(grad_tensor).any(): print(f"  DEBUG GRAD WARNING: {name} mengandung Inf!"); valid = False
+    if grad_tensor.dtype != expected_dtype: print(f"  DEBUG GRAD WARNING: {name} dtype ({grad_tensor.dtype}) tidak cocok ({expected_dtype})!")
     return valid
 
 class L4QQuantizedConv2dFunction(torch.autograd.Function):
@@ -35,10 +27,8 @@ class L4QQuantizedConv2dFunction(torch.autograd.Function):
     def forward(ctx, x, w0, lora_a, lora_b, bias,
                 alpha, n_bits, q_scale, quant_group_size,
                 stride, padding, dilation, groups):
-        
+        # ... (Kode forward Anda yang sudah ada, pastikan effective_qgs_fwd dihitung dengan benar) ...
         kernel_shape_dims = w0.shape[1:] 
-        # num_kernel_elements_per_filter = math.prod(kernel_shape_dims) # Tidak dipakai di forward
-
         delta_w_flat = lora_b @ lora_a 
         delta_w = delta_w_flat.view(w0.shape[0], *kernel_shape_dims) 
         w_comb = w0 + alpha * delta_w
@@ -47,29 +37,30 @@ class L4QQuantizedConv2dFunction(torch.autograd.Function):
         effective_qgs_fwd = quant_group_size
         if quant_group_size != -1:
             if w_comb.numel() == 0 or w_comb.numel() < quant_group_size or w_comb.numel() % quant_group_size != 0:
-                # print(f"L4QConv2dFunction.forward INFO: Fallback ke per-tensor untuk w_comb shape {w_comb.shape} dan q_gs {quant_group_size}")
                 effective_qgs_fwd = -1 
+        
+        w_scaled_grouped = None
+        w_scaled = None
 
         if effective_qgs_fwd != -1:
             original_shape = w_comb.shape
             num_quant_groups = w_comb.numel() // effective_qgs_fwd
             w_comb_grouped = w_comb.reshape(num_quant_groups, effective_qgs_fwd)
             
+            current_q_scale = q_scale
             if q_scale.numel() == num_quant_groups:
-                scale_expanded = q_scale.unsqueeze(1)
+                scale_expanded = current_q_scale.unsqueeze(1)
             elif q_scale.numel() == 1: 
-                scale_expanded = q_scale
+                scale_expanded = current_q_scale
             else:
-                # print(f"L4QConv2dFunction.forward WARNING: Shape q_scale ({q_scale.shape}) tidak cocok ({num_quant_groups} groups). Menggunakan q_scale sebagai per-tensor.")
-                scale_expanded = q_scale 
+                scale_expanded = current_q_scale 
                 effective_qgs_fwd = -1
-                w_scaled = w_comb / (q_scale.item() + 1e-9)
             
             if effective_qgs_fwd != -1:
                  w_scaled_grouped = w_comb_grouped / (scale_expanded + 1e-9)
         
         if effective_qgs_fwd == -1: 
-            w_scaled = w_comb / (q_scale.item() + 1e-9) if q_scale.numel() == 1 else w_comb / (q_scale + 1e-9)
+            w_scaled = w_comb / (q_scale + 1e-9) if q_scale.numel() > 1 else w_comb / (q_scale.item() + 1e-9)
 
         if effective_qgs_fwd != -1:
             quantized_w_int_grouped = torch.round(torch.clamp(w_scaled_grouped, q_n, q_p))
@@ -79,13 +70,13 @@ class L4QQuantizedConv2dFunction(torch.autograd.Function):
             quantized_w_int_for_backward = quantized_w_int_grouped
         else: 
             quantized_w_int = torch.round(torch.clamp(w_scaled, q_n, q_p))
-            w_q = quantized_w_int * (q_scale.item() if q_scale.numel() == 1 else q_scale)
+            w_q = quantized_w_int * (q_scale if q_scale.numel() > 1 else q_scale.item())
             w_scaled_for_ste = w_scaled
             quantized_w_int_for_backward = quantized_w_int
             
         output = F.conv2d(x, w_q, bias, stride, padding, dilation, groups)
 
-        ctx.save_for_backward(x, w0, lora_a, lora_b, bias, q_scale, w_q, quantized_w_int_for_backward, w_comb, delta_w) # delta_w disimpan
+        ctx.save_for_backward(x, w0, lora_a, lora_b, bias, q_scale, w_q, quantized_w_int_for_backward, w_comb, delta_w)
         ctx.alpha = alpha
         ctx.q_n, ctx.q_p = q_n, q_p
         ctx.stride, ctx.padding, ctx.dilation, ctx.groups = stride, padding, dilation, groups
@@ -95,7 +86,7 @@ class L4QQuantizedConv2dFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        x, w0, lora_a, lora_b, bias, q_scale, w_q, quantized_w_int, w_comb, delta_w = ctx.saved_tensors # delta_w diambil
+        x, w0, lora_a, lora_b, bias, q_scale, w_q, quantized_w_int, w_comb, delta_w = ctx.saved_tensors
         alpha = ctx.alpha
         effective_qgs = ctx.effective_quant_group_size_used_in_fwd
         q_n, q_p = ctx.q_n, ctx.q_p
@@ -104,10 +95,13 @@ class L4QQuantizedConv2dFunction(torch.autograd.Function):
 
         grad_x = grad_w0 = grad_lora_a = grad_lora_b = grad_bias = grad_q_scale = None
         
+        grad_output_dtype = grad_output.to(x.dtype)
+
         if ctx.needs_input_grad[0]:
-            grad_x = F.grad.conv2d_input(x.shape, w_q, grad_output, stride, padding, dilation, groups)
+            grad_x = F.grad.conv2d_input(x.shape, w_q.to(x.dtype), grad_output_dtype, stride, padding, dilation, groups)
         
-        grad_L_wrt_wq = F.grad.conv2d_weight(x, w_q.shape, grad_output, stride, padding, dilation, groups)
+        grad_L_wrt_wq_intermediate = F.grad.conv2d_weight(x, w_q.shape, grad_output_dtype, stride, padding, dilation, groups)
+        grad_L_wrt_wq = grad_L_wrt_wq_intermediate.to(w_q.dtype)
         
         if effective_qgs != -1:
             ste_mask_grouped = (w_scaled_for_ste >= q_n) & (w_scaled_for_ste <= q_p)
@@ -115,7 +109,7 @@ class L4QQuantizedConv2dFunction(torch.autograd.Function):
         else:
             ste_mask = (w_scaled_for_ste >= q_n) & (w_scaled_for_ste <= q_p)
         
-        grad_L_wrt_wq_masked_by_ste = grad_L_wrt_wq * ste_mask
+        grad_L_wrt_wq_masked_by_ste = grad_L_wrt_wq * ste_mask.to(grad_L_wrt_wq.dtype)
         grad_L_wrt_delta_w = alpha * grad_L_wrt_wq_masked_by_ste
         grad_L_wrt_delta_w_flat = grad_L_wrt_delta_w.reshape(w0.shape[0], -1)
 
@@ -124,36 +118,42 @@ class L4QQuantizedConv2dFunction(torch.autograd.Function):
         if ctx.needs_input_grad[3]: 
             grad_lora_b = grad_L_wrt_delta_w_flat @ lora_a.transpose(0, 1)
         
-        if ctx.needs_input_grad[7]: # q_scale (indeks ke-8 di forward, jadi 7 di sini)
+        if ctx.needs_input_grad[7]: # q_scale
+            quantized_w_int_casted = quantized_w_int.to(grad_L_wrt_wq.dtype)
             if effective_qgs != -1:
                 num_quant_groups = w_comb.numel() // effective_qgs
                 grad_L_wrt_wq_grouped = grad_L_wrt_wq.reshape(num_quant_groups, effective_qgs)
-                grad_q_scale_grouped = (grad_L_wrt_wq_grouped * quantized_w_int).sum(dim=1)
-                grad_q_scale = grad_q_scale_grouped
-            else:
-                grad_q_scale = (grad_L_wrt_wq * quantized_w_int).sum()
+                grad_q_scale_grouped = (grad_L_wrt_wq_grouped * quantized_w_int_casted).sum(dim=1)
+                grad_q_scale = grad_q_scale_grouped.to(q_scale.dtype)
+            else: # Per-tensor
+                grad_q_scale_sum = (grad_L_wrt_wq * quantized_w_int_casted).sum()
+                # Pastikan grad_q_scale memiliki shape yang sama dengan q_scale input
+                if q_scale.numel() == 1 and q_scale.ndim == 1: # Jika q_scale adalah [1]
+                    grad_q_scale = grad_q_scale_sum.reshape(1).to(q_scale.dtype)
+                elif q_scale.numel() == 1 and q_scale.ndim == 0: # Jika q_scale adalah skalar
+                     grad_q_scale = grad_q_scale_sum.to(q_scale.dtype)
+                else:
+                    grad_q_scale = grad_q_scale_sum.to(q_scale.dtype)
         
-        if bias is not None and ctx.needs_input_grad[4]: # bias adalah input ke-5 (indeks 4)
-            grad_bias = grad_output.sum(dim=[0, 2, 3])
-            if len(grad_bias.shape) == 0 and bias.numel() == 1: 
-                 pass 
-            elif len(grad_bias.shape) > 0 and bias.numel() == 1 and grad_bias.numel() == 1: 
-                 grad_bias = grad_bias.squeeze()
+        if bias is not None and ctx.needs_input_grad[4]: # bias
+            grad_bias_intermediate = grad_output_dtype.sum(dim=[0, 2, 3])
+            grad_bias = grad_bias_intermediate.to(bias.dtype)
+            if len(grad_bias.shape) == 0 and bias.numel() == 1: pass 
+            elif len(grad_bias.shape) > 0 and bias.numel() == 1 and grad_bias.numel() == 1: grad_bias = grad_bias.squeeze()
         
-        # --- BLOK DEBUG ---
-        # print("\n--- Debug Gradients L4QQuantizedConv2dFunction.backward ---")
-        # check_tensor_grad(grad_x, "grad_x (conv2d)")
-        # print(f"  grad_w0 (conv2d): {grad_w0}") # Harusnya None
-        # check_tensor_grad(grad_lora_a, "grad_lora_a (conv2d)")
-        # check_tensor_grad(grad_lora_b, "grad_lora_b (conv2d)")
-        # check_tensor_grad(grad_bias, "grad_bias (conv2d)")
-        # check_tensor_grad(grad_q_scale, "grad_q_scale (conv2d)")
-        # print("--- Akhir Debug Gradients Conv2d ---")
+        print("\n--- Debug Gradients L4QQuantizedConv2dFunction.backward ---")
+        check_tensor_grad(grad_x, "grad_x (conv2d)")
+        print(f"  DEBUG GRAD: grad_w0 (conv2d): {grad_w0}")
+        check_tensor_grad(grad_lora_a, "grad_lora_a (conv2d)")
+        check_tensor_grad(grad_lora_b, "grad_lora_b (conv2d)")
+        check_tensor_grad(grad_bias, "grad_bias (conv2d)")
+        check_tensor_grad(grad_q_scale, "grad_q_scale (conv2d)")
+        print("--- Akhir Debug Gradients Conv2d ---")
 
-        # Urutan return: x, w0, lora_a, lora_b, bias, alpha, n_bits, q_scale, quant_group_size, stride, padding, dilation, groups
         return (grad_x, grad_w0, grad_lora_a, grad_lora_b, grad_bias,
                 None, None, grad_q_scale, None, 
                 None, None, None, None)
+
 
 class L4QQuantizedConv2d(nn.Module):
     def __init__(self, in_channels: int, out_channels: int, kernel_size,
