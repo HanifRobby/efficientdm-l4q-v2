@@ -80,15 +80,23 @@ def Normalize(in_channels, num_groups=32):
 
 
 class Upsample(nn.Module):
-    def __init__(self, in_channels, with_conv):
+    def __init__(self, in_channels, with_conv, l4q_params=None): # Tambahkan l4q_params
         super().__init__()
         self.with_conv = with_conv
         if self.with_conv:
-            self.conv = make_l4q_conv2d(in_channels,
-                                        in_channels,
-                                        kernel_size=3,
-                                        stride=1,
-                                        padding=1)
+            if l4q_params and l4q_params.get("enabled", False):
+                self.conv = make_l4q_conv2d(in_channels,
+                                            in_channels,
+                                            kernel_size=3,
+                                            stride=1,
+                                            padding=1,
+                                            lora_rank=l4q_params.get("lora_rank", 4),
+                                            n_bits=l4q_params.get("n_bits", 4),
+                                            alpha=l4q_params.get("alpha", 1.0),
+                                            quant_group_size=l4q_params.get("quant_group_size", -1))
+            else:
+                self.conv = nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=1, padding=1)
+
 
     def forward(self, x):
         x = torch.nn.functional.interpolate(x, scale_factor=2.0, mode="nearest")
@@ -98,16 +106,23 @@ class Upsample(nn.Module):
 
 
 class Downsample(nn.Module):
-    def __init__(self, in_channels, with_conv):
+    def __init__(self, in_channels, with_conv, l4q_params=None): # Tambahkan l4q_params
         super().__init__()
         self.with_conv = with_conv
         if self.with_conv:
-            # no asymmetric padding in torch conv, must do it ourselves
-            self.conv = make_l4q_conv2d(in_channels,
-                                        in_channels,
-                                        kernel_size=3,
-                                        stride=2,
-                                        padding=0)
+            if l4q_params and l4q_params.get("enabled", False):
+                self.conv = make_l4q_conv2d(in_channels,
+                                            in_channels,
+                                            kernel_size=3,
+                                            stride=2,
+                                            padding=0, # Padding manual di forward
+                                            lora_rank=l4q_params.get("lora_rank", 4),
+                                            n_bits=l4q_params.get("n_bits", 4),
+                                            alpha=l4q_params.get("alpha", 1.0),
+                                            quant_group_size=l4q_params.get("quant_group_size", -1))
+            else:
+                self.conv = nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=2, padding=0)
+
 
     def forward(self, x):
         if self.with_conv:
