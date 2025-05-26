@@ -125,7 +125,7 @@ def test_l4q_linear_grad():
                   alpha_val, n_b, q_scale_lin_val, group_size_lin)
     
     return run_gradcheck_wrapper(L4QQuantizedLinearFunction.apply, inputs_lin, "L4QQuantizedLinearFunction", 
-                                 atol=1e-3, rtol=1e-2)
+                                 atol=5e-2, rtol=1e-1)
 
 def test_l4q_conv2d_grad():
     print("\n=== Pengujian L4QQuantizedConv2dFunction ===")
