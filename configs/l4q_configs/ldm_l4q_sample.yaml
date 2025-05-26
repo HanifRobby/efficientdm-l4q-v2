@@ -1,0 +1,79 @@
+model:
+  base_learning_rate: 0.0001
+  target: ldm.models.diffusion.ddpm.LatentDiffusion
+  params:
+    linear_start: 0.0015
+    linear_end: 0.0195
+    num_timesteps_cond: 1
+    log_every_t: 200
+    timesteps: 1000
+    first_stage_key: image
+    cond_stage_key: class_label
+    image_size: 64 # Ukuran gambar input ke Unet setelah VAE
+    channels: 3    # Channel input ke Unet setelah VAE (sesuai z_channels VAE jika berbeda)
+    cond_stage_trainable: true
+    conditioning_key: crossattn # Bisa juga 'concat' atau 'hybrid' tergantung model
+    monitor: val/loss
+    use_ema: False
+    
+    unet_config:
+      target: ldm.modules.diffusionmodules.openaimodel.UNetModel
+      params:
+        image_size: 64 # Harus konsisten dengan image_size di atas (input latent ke Unet)
+        in_channels: 3 # Channel input latent ke Unet (sesuai z_channels VAE)
+        out_channels: 3 # Channel output latent dari Unet (biasanya sama dengan in_channels)
+        model_channels: 192
+        attention_resolutions:
+        - 8
+        - 4
+        # - 2 # Resolusi asli memiliki 2, sesuaikan jika perlu
+        num_res_blocks: 2
+        channel_mult:
+        - 1
+        - 2
+        - 3
+        # - 5 # Channel_mult asli memiliki 5, sesuaikan jika perlu
+        - 4 # Mengganti 5 dengan 4 agar lebih umum atau sesuai dengan model LDM lain
+        num_heads: 1 # Atau 8, 4 tergantung konfigurasi attention
+        use_spatial_transformer: true # Jika model menggunakan spatial transformer
+        transformer_depth: 1          # Kedalaman transformer per blok
+        context_dim: 512              # Dimensi konteks untuk cross-attention
+        # Tambahan parameter L4Q di sini
+        # Parameter ini perlu dibaca dan diteruskan ke make_l4q_linear/conv2d
+        # saat UNetModel menginisialisasi layernya.
+        l4q_params:
+          enabled: true               # Flag untuk mengaktifkan layer L4Q
+          lora_rank: 4                # Rank untuk LoRA (contoh: 4, 8)
+          n_bits: 4                   # Jumlah bit untuk kuantisasi (contoh: 4, 3)
+          alpha: 1.0                  # Faktor skala untuk LoRA
+          quant_group_size: -1        # Ukuran grup untuk kuantisasi bobot (-1 untuk per-tensor, 64 atau 128 untuk group-wise)
+    
+    first_stage_config:
+      target: ldm.models.autoencoder.VQModelInterface # Atau AutoKLMS, dll.
+      params:
+        embed_dim: 3 # Dimensi embedding VQGAN (jika VQModel) atau z_channels (jika AutoKL)
+        n_embed: 8192 # Jumlah embedding VQGAN
+        ddconfig:
+          double_z: false
+          z_channels: 3 # Output channels dari encoder VAE, ini akan menjadi in_channels Unet
+          resolution: 256
+          in_channels: 3
+          out_ch: 3
+          ch: 128
+          ch_mult:
+          - 1
+          - 2
+          # - 4 # ch_mult asli memiliki 4, sesuaikan jika perlu
+          - 2 # Mengubah dari 4 ke 2 untuk konsistensi dengan contoh LDM lain atau untuk model yang lebih kecil
+          num_res_blocks: 2
+          attn_resolutions: [] # Kosongkan jika tidak ada attention di VAE
+          dropout: 0.0
+        lossconfig:
+          target: torch.nn.Identity # Atau VQLPIPSWithDiscriminator untuk VQGAN
+    
+    cond_stage_config: # Konfigurasi untuk conditioning model
+      target: ldm.modules.encoders.modules.ClassEmbedder # Jika conditioning berbasis kelas
+      params:
+        n_classes: 1001 # Jumlah kelas (misalnya ImageNet 1k + 1 untuk tanpa kelas)
+        embed_dim: 512  # Dimensi embedding kelas, harus cocok dengan context_dim Unet jika cross-attn
+        key: class_label
