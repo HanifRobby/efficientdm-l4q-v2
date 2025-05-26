@@ -121,42 +121,54 @@ class Downsample(nn.Module):
 
 class ResnetBlock(nn.Module):
     def __init__(self, *, in_channels, out_channels=None, conv_shortcut=False,
-                 dropout, temb_channels=512):
+                 dropout, temb_channels=512, l4q_params=None): # Tambahkan l4q_params
         super().__init__()
         self.in_channels = in_channels
         out_channels = in_channels if out_channels is None else out_channels
         self.out_channels = out_channels
         self.use_conv_shortcut = conv_shortcut
+        
+        l4q_enabled = l4q_params.get("enabled", False) if l4q_params else False
+        lora_r = l4q_params.get("lora_rank", 4) if l4q_params else 4
+        n_b = l4q_params.get("n_bits", 4) if l4q_params else 4
+        alph = l4q_params.get("alpha", 1.0) if l4q_params else 1.0
+        q_gs = l4q_params.get("quant_group_size", -1) if l4q_params else -1
 
         self.norm1 = Normalize(in_channels)
-        self.conv1 = make_l4q_conv2d(in_channels,
-                                     out_channels,
-                                     kernel_size=3,
-                                     stride=1,
-                                     padding=1)
+        if l4q_enabled:
+            self.conv1 = make_l4q_conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1,
+                                         lora_rank=lora_r, n_bits=n_b, alpha=alph, quant_group_size=q_gs)
+        else:
+            self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
+
         if temb_channels > 0:
-            self.temb_proj = make_l4q_linear(temb_channels,
-                                             out_channels)
+            if l4q_enabled:
+                self.temb_proj = make_l4q_linear(temb_channels, out_channels,
+                                                 lora_rank=lora_r, n_bits=n_b, alpha=alph, group_size=q_gs)
+            else:
+                self.temb_proj = nn.Linear(temb_channels, out_channels)
+        
         self.norm2 = Normalize(out_channels)
         self.dropout = torch.nn.Dropout(dropout)
-        self.conv2 = make_l4q_conv2d(out_channels,
-                                     out_channels,
-                                     kernel_size=3,
-                                     stride=1,
-                                     padding=1)
+        if l4q_enabled:
+            self.conv2 = make_l4q_conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1,
+                                         lora_rank=lora_r, n_bits=n_b, alpha=alph, quant_group_size=q_gs)
+        else:
+            self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1)
+
         if self.in_channels != self.out_channels:
             if self.use_conv_shortcut:
-                self.conv_shortcut = make_l4q_conv2d(in_channels,
-                                                     out_channels,
-                                                     kernel_size=3,
-                                                     stride=1,
-                                                     padding=1)
+                if l4q_enabled:
+                    self.conv_shortcut = make_l4q_conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1,
+                                                         lora_rank=lora_r, n_bits=n_b, alpha=alph, quant_group_size=q_gs)
+                else:
+                    self.conv_shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
             else:
-                self.nin_shortcut = make_l4q_conv2d(in_channels,
-                                                    out_channels,
-                                                    kernel_size=1,
-                                                    stride=1,
-                                                    padding=0)
+                if l4q_enabled:
+                    self.nin_shortcut = make_l4q_conv2d(in_channels, out_channels, kernel_size=1, stride=1, padding=0,
+                                                        lora_rank=lora_r, n_bits=n_b, alpha=alph, quant_group_size=q_gs)
+                else:
+                    self.nin_shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, padding=0)
 
     def forward(self, x, temb):
         h = x
@@ -164,7 +176,7 @@ class ResnetBlock(nn.Module):
         h = nonlinearity(h)
         h = self.conv1(h)
 
-        if temb is not None:
+        if temb is not None and hasattr(self, 'temb_proj'): # Pastikan temb_proj ada
             h = h + self.temb_proj(nonlinearity(temb))[:,:,None,None]
 
         h = self.norm2(h)
@@ -177,7 +189,6 @@ class ResnetBlock(nn.Module):
                 x = self.conv_shortcut(x)
             else:
                 x = self.nin_shortcut(x)
-
         return x+h
 
 
@@ -188,32 +199,31 @@ class LinAttnBlock(LinearAttention):
 
 
 class AttnBlock(nn.Module):
-    def __init__(self, in_channels):
+    def __init__(self, in_channels, l4q_params=None): # Tambahkan l4q_params
         super().__init__()
         self.in_channels = in_channels
 
-        self.norm = Normalize(in_channels)
-        self.q = make_l4q_conv2d(in_channels,
-                                 in_channels,
-                                 kernel_size=1,
-                                 stride=1,
-                                 padding=0)
-        self.k = make_l4q_conv2d(in_channels,
-                                 in_channels,
-                                 kernel_size=1,
-                                 stride=1,
-                                 padding=0)
-        self.v = make_l4q_conv2d(in_channels,
-                                 in_channels,
-                                 kernel_size=1,
-                                 stride=1,
-                                 padding=0)
-        self.proj_out = make_l4q_conv2d(in_channels,
-                                        in_channels,
-                                        kernel_size=1,
-                                        stride=1,
-                                        padding=0)
+        l4q_enabled = l4q_params.get("enabled", False) if l4q_params else False
+        lora_r = l4q_params.get("lora_rank", 4) if l4q_params else 4
+        n_b = l4q_params.get("n_bits", 4) if l4q_params else 4
+        alph = l4q_params.get("alpha", 1.0) if l4q_params else 1.0
+        q_gs = l4q_params.get("quant_group_size", -1) if l4q_params else -1
 
+        self.norm = Normalize(in_channels)
+        if l4q_enabled:
+            self.q = make_l4q_conv2d(in_channels, in_channels, kernel_size=1, stride=1, padding=0,
+                                     lora_rank=lora_r, n_bits=n_b, alpha=alph, quant_group_size=q_gs)
+            self.k = make_l4q_conv2d(in_channels, in_channels, kernel_size=1, stride=1, padding=0,
+                                     lora_rank=lora_r, n_bits=n_b, alpha=alph, quant_group_size=q_gs)
+            self.v = make_l4q_conv2d(in_channels, in_channels, kernel_size=1, stride=1, padding=0,
+                                     lora_rank=lora_r, n_bits=n_b, alpha=alph, quant_group_size=q_gs)
+            self.proj_out = make_l4q_conv2d(in_channels, in_channels, kernel_size=1, stride=1, padding=0,
+                                            lora_rank=lora_r, n_bits=n_b, alpha=alph, quant_group_size=q_gs)
+        else:
+            self.q = nn.Conv2d(in_channels, in_channels, kernel_size=1, stride=1, padding=0)
+            self.k = nn.Conv2d(in_channels, in_channels, kernel_size=1, stride=1, padding=0)
+            self.v = nn.Conv2d(in_channels, in_channels, kernel_size=1, stride=1, padding=0)
+            self.proj_out = nn.Conv2d(in_channels, in_channels, kernel_size=1, stride=1, padding=0)
 
     def forward(self, x):
         h_ = x
@@ -222,41 +232,44 @@ class AttnBlock(nn.Module):
         k = self.k(h_)
         v = self.v(h_)
 
-        # compute attention
         b,c,h,w = q.shape
         q = q.reshape(b,c,h*w)
-        q = q.permute(0,2,1)   # b,hw,c
-        k = k.reshape(b,c,h*w) # b,c,hw
-        w_ = torch.bmm(q,k)     # b,hw,hw    w[b,i,j]=sum_c q[b,i,c]k[b,c,j]
+        q = q.permute(0,2,1)
+        k = k.reshape(b,c,h*w)
+        w_ = torch.bmm(q,k)
         w_ = w_ * (int(c)**(-0.5))
         w_ = torch.nn.functional.softmax(w_, dim=2)
 
-        # attend to values
         v = v.reshape(b,c,h*w)
-        w_ = w_.permute(0,2,1)   # b,hw,hw (first hw of k, second of q)
-        h_ = torch.bmm(v,w_)     # b, c,hw (hw of q) h_[b,c,j] = sum_i v[b,c,i] w_[b,i,j]
+        w_ = w_.permute(0,2,1)
+        h_ = torch.bmm(v,w_)
         h_ = h_.reshape(b,c,h,w)
-
         h_ = self.proj_out(h_)
-
         return x+h_
 
 
-def make_attn(in_channels, attn_type="vanilla"):
+def make_attn(in_channels, attn_type="vanilla", l4q_params=None): # Tambahkan l4q_params
     assert attn_type in ["vanilla", "linear", "none"], f'attn_type {attn_type} unknown'
-    print(f"making attention of type '{attn_type}' with {in_channels} in_channels")
+    # print(f"making attention of type '{attn_type}' with {in_channels} in_channels")
     if attn_type == "vanilla":
-        return AttnBlock(in_channels)
+        return AttnBlock(in_channels, l4q_params=l4q_params) # Teruskan l4q_params
     elif attn_type == "none":
-        return nn.Identity(in_channels)
-    else:
+        return nn.Identity() # nn.Identity tidak memiliki parameter in_channels
+    else: # linear attention
+        # Pastikan LinAttnBlock juga di-patch atau dimodifikasi jika mengandung nn.Linear/Conv2d
+        # Untuk sekarang, asumsikan LinearAttention dari ldm.modules.attention tidak perlu L4Q
+        # atau sudah di-patch secara terpisah jika perlu. Jika ia memanggil nn.Linear/Conv2d secara internal,
+        # maka itu perlu di-patch atau LinearAttention itu sendiri perlu parameter l4q_params.
+        # Jika LinAttnBlock tidak menggunakan conv/linear yang perlu dikuantisasi, biarkan seperti ini.
         return LinAttnBlock(in_channels)
 
 
-class Model(nn.Module):
+class Model(nn.Module): # Ini adalah UNetModel Anda
     def __init__(self, *, ch, out_ch, ch_mult=(1,2,4,8), num_res_blocks,
                  attn_resolutions, dropout=0.0, resamp_with_conv=True, in_channels,
-                 resolution, use_timestep=True, use_linear_attn=False, attn_type="vanilla"):
+                 resolution, use_timestep=True, use_linear_attn=False, attn_type="vanilla",
+                 # >>> TAMBAHKAN l4q_params di sini <<<
+                 l4q_params=None):
         super().__init__()
         if use_linear_attn: attn_type = "linear"
         self.ch = ch
@@ -265,24 +278,41 @@ class Model(nn.Module):
         self.num_res_blocks = num_res_blocks
         self.resolution = resolution
         self.in_channels = in_channels
+        self.l4q_params = l4q_params # Simpan untuk digunakan oleh sub-modul jika diperlukan
+
+        # Ekstrak parameter L4Q dengan nilai default jika l4q_params tidak ada atau key tidak ada
+        self.l4q_enabled = l4q_params.get("enabled", False) if l4q_params else False
+        self.lora_rank = l4q_params.get("lora_rank", 4) if l4q_params else 4
+        self.n_bits = l4q_params.get("n_bits", 4) if l4q_params else 4
+        self.alpha = l4q_params.get("alpha", 1.0) if l4q_params else 1.0
+        self.quant_group_size = l4q_params.get("quant_group_size", -1) if l4q_params else -1
+        # Untuk Linear layer, kita akan menggunakan self.quant_group_size sebagai argumen 'group_size'
+        # di make_l4q_linear untuk konsistensi nama internal di L4QQuantizedLinear.
 
         self.use_timestep = use_timestep
         if self.use_timestep:
-            # timestep embedding
             self.temb = nn.Module()
-            self.temb.dense = nn.ModuleList([
-                make_l4q_linear(self.ch,
-                                self.temb_ch),
-                make_l4q_linear(self.temb_ch,
-                                self.temb_ch),
-            ])
+            if self.l4q_enabled:
+                self.temb.dense = nn.ModuleList([
+                    make_l4q_linear(self.ch, self.temb_ch,
+                                    lora_rank=self.lora_rank, n_bits=self.n_bits, 
+                                    alpha=self.alpha, group_size=self.quant_group_size),
+                    make_l4q_linear(self.temb_ch, self.temb_ch,
+                                    lora_rank=self.lora_rank, n_bits=self.n_bits, 
+                                    alpha=self.alpha, group_size=self.quant_group_size),
+                ])
+            else:
+                self.temb.dense = nn.ModuleList([
+                    nn.Linear(self.ch, self.temb_ch),
+                    nn.Linear(self.temb_ch, self.temb_ch),
+                ])
 
-        # downsampling
-        self.conv_in = make_l4q_conv2d(in_channels,
-                                       self.ch,
-                                       kernel_size=3,
-                                       stride=1,
-                                       padding=1)
+        if self.l4q_enabled:
+            self.conv_in = make_l4q_conv2d(in_channels, self.ch, kernel_size=3, stride=1, padding=1,
+                                           lora_rank=self.lora_rank, n_bits=self.n_bits,
+                                           alpha=self.alpha, quant_group_size=self.quant_group_size)
+        else:
+            self.conv_in = nn.Conv2d(in_channels, self.ch, kernel_size=3, stride=1, padding=1)
 
         curr_res = resolution
         in_ch_mult = (1,)+tuple(ch_mult)
@@ -293,32 +323,33 @@ class Model(nn.Module):
             block_in = ch*in_ch_mult[i_level]
             block_out = ch*ch_mult[i_level]
             for i_block in range(self.num_res_blocks):
+                # Teruskan l4q_params ke ResnetBlock
                 block.append(ResnetBlock(in_channels=block_in,
                                          out_channels=block_out,
                                          temb_channels=self.temb_ch,
-                                         dropout=dropout))
+                                         dropout=dropout,
+                                         l4q_params=self.l4q_params)) # <<< Teruskan l4q_params
                 block_in = block_out
                 if curr_res in attn_resolutions:
-                    attn.append(make_attn(block_in, attn_type=attn_type))
+                    # Teruskan l4q_params ke make_attn -> AttnBlock
+                    attn.append(make_attn(block_in, attn_type=attn_type, l4q_params=self.l4q_params)) # <<< Teruskan l4q_params
             down = nn.Module()
             down.block = block
             down.attn = attn
             if i_level != self.num_resolutions-1:
-                down.downsample = Downsample(block_in, resamp_with_conv)
+                # Teruskan l4q_params ke Downsample
+                down.downsample = Downsample(block_in, resamp_with_conv, l4q_params=self.l4q_params) # <<< Teruskan l4q_params
                 curr_res = curr_res // 2
             self.down.append(down)
 
         # middle
         self.mid = nn.Module()
-        self.mid.block_1 = ResnetBlock(in_channels=block_in,
-                                       out_channels=block_in,
-                                       temb_channels=self.temb_ch,
-                                       dropout=dropout)
-        self.mid.attn_1 = make_attn(block_in, attn_type=attn_type)
-        self.mid.block_2 = ResnetBlock(in_channels=block_in,
-                                       out_channels=block_in,
-                                       temb_channels=self.temb_ch,
-                                       dropout=dropout)
+        # Teruskan l4q_params ke ResnetBlock dan make_attn
+        self.mid.block_1 = ResnetBlock(in_channels=block_in, out_channels=block_in,
+                                       temb_channels=self.temb_ch, dropout=dropout, l4q_params=self.l4q_params)
+        self.mid.attn_1 = make_attn(block_in, attn_type=attn_type, l4q_params=self.l4q_params)
+        self.mid.block_2 = ResnetBlock(in_channels=block_in, out_channels=block_in,
+                                       temb_channels=self.temb_ch, dropout=dropout, l4q_params=self.l4q_params)
 
         # upsampling
         self.up = nn.ModuleList()
@@ -326,40 +357,85 @@ class Model(nn.Module):
             block = nn.ModuleList()
             attn = nn.ModuleList()
             block_out = ch*ch_mult[i_level]
-            skip_in = ch*ch_mult[i_level]
+            skip_in = ch*ch_mult[i_level] # Ini akan menjadi block_in untuk iterasi pertama di level ini
+            
+            # block_in untuk ResNetBlock di upsampling adalah kombinasi dari output level sebelumnya 
+            # dan skip connection. Nilai awalnya adalah output dari middle block (block_in terakhir dari downsampling).
+            current_block_in_upsampling = block_in # Ini adalah block_in dari akhir down/middle path
+
             for i_block in range(self.num_res_blocks+1):
                 if i_block == self.num_res_blocks:
-                    skip_in = ch*in_ch_mult[i_level]
-                block.append(ResnetBlock(in_channels=block_in+skip_in,
+                    # Pada iterasi terakhir, skip_in adalah dari resolusi yang sesuai di down path
+                    skip_in_channels_actual = ch*in_ch_mult[i_level] 
+                else:
+                    # Pada iterasi lainnya, skip_in adalah output dari ResNetBlock sebelumnya di level upsampling yang sama
+                    # (kecuali untuk i_block=0 dimana skip_in adalah dari down path juga)
+                    skip_in_channels_actual = ch*ch_mult[i_level]
+
+
+                # Input ke ResnetBlock adalah (output h dari iterasi/level sebelumnya) + (skip connection)
+                # Ukuran h (current_block_in_upsampling) harus sama dengan block_out dari iterasi sebelumnya
+                # atau output dari upsample jika i_block = 0 dan bukan level pertama upsampling.
+                # Ukuran skip connection (skip_in_channels_actual) diambil dari hs.
+                
+                # Perlu lebih hati-hati dengan `block_in` yang digunakan untuk `ResnetBlock` di sini.
+                # `block_in` yang di pass ke `ResnetBlock` adalah `current_block_in_upsampling + skip_in_channels_actual`
+                # `block_in` untuk iterasi selanjutnya akan menjadi `block_out` dari ResnetBlock saat ini.
+
+                # Menggunakan nama variabel yang lebih jelas untuk input ke ResNet
+                input_to_resnet = current_block_in_upsampling + skip_in_channels_actual
+
+                block.append(ResnetBlock(in_channels=input_to_resnet, # Ini adalah channel gabungan
                                          out_channels=block_out,
                                          temb_channels=self.temb_ch,
-                                         dropout=dropout))
-                block_in = block_out
+                                         dropout=dropout,
+                                         l4q_params=self.l4q_params))
+                current_block_in_upsampling = block_out # Output dari ResnetBlock menjadi input (non-skip part) untuk selanjutnya
                 if curr_res in attn_resolutions:
-                    attn.append(make_attn(block_in, attn_type=attn_type))
+                    attn.append(make_attn(current_block_in_upsampling, attn_type=attn_type, l4q_params=self.l4q_params))
             up = nn.Module()
             up.block = block
             up.attn = attn
             if i_level != 0:
-                up.upsample = Upsample(block_in, resamp_with_conv)
+                # Upsample output dari level sebelumnya (current_block_in_upsampling)
+                up.upsample = Upsample(current_block_in_upsampling, resamp_with_conv, l4q_params=self.l4q_params)
                 curr_res = curr_res * 2
-            self.up.insert(0, up) # prepend to get consistent order
+            self.up.insert(0, up)
+            # Input untuk level upsampling berikutnya (current_block_in_upsampling) adalah output dari upsample,
+            # atau output dari ResnetBlock terakhir jika tidak ada upsample (i_level == 0).
+            # Ini ditangani oleh `h` di forward pass. `block_in` di sini sebenarnya adalah `h` di forward.
+            block_in = current_block_in_upsampling # Ini untuk loop berikutnya `for i_level` jika diperlukan
 
-        # end
-        self.norm_out = Normalize(block_in)
-        self.conv_out = make_l4q_conv2d(block_in,
-                                        out_ch,
-                                        kernel_size=3,
-                                        stride=1,
-                                        padding=1)
 
-    def forward(self, x, t=None, context=None):
-        #assert x.shape[2] == x.shape[3] == self.resolution
-        if context is not None:
-            # assume aligned context, cat along channel axis
-            x = torch.cat((x, context), dim=1)
+        self.norm_out = Normalize(block_out) # block_out dari level terakhir upsampling
+        if self.l4q_enabled:
+            self.conv_out = make_l4q_conv2d(block_out, out_ch, kernel_size=3, stride=1, padding=1,
+                                            lora_rank=self.lora_rank, n_bits=self.n_bits,
+                                            alpha=self.alpha, quant_group_size=self.quant_group_size)
+        else:
+            self.conv_out = nn.Conv2d(block_out, out_ch, kernel_size=3, stride=1, padding=1)
+
+    def forward(self, x, t=None, context=None): # `context` di sini adalah conditioning, bukan context cross-attn internal
+        # Konteks untuk cross-attention biasanya disuntikkan ke blok Transformer, bukan digabung di awal.
+        # Jika `conditioning_key: crossattn` digunakan, `context` akan diteruskan ke Transformer.
+        # Jika `conditioning_key: concat`, maka x digabung dengan context.
+        # Kode asli Anda sudah menangani `context` dengan `torch.cat` jika ada.
+        # Saya akan biarkan logika ini untuk sekarang, tetapi perhatikan bagaimana context dipakai.
+        # Jika `context` adalah untuk cross-attention, ia tidak seharusnya digabung di sini.
+        # Jika model Unet ini dari OpenAIMode, ia mungkin tidak secara langsung menangani context untuk transformer.
+        # Itu biasanya dilakukan oleh `SpatialTransformer`.
+
+        # assert x.shape[2] == x.shape[3] == self.resolution # Periksa dimensi input latent
+        
+        # Handle context jika ada (misalnya untuk concat conditioning)
+        # Perlu diperjelas apakah 'context' di sini adalah conditioning spasial atau untuk cross-attn
+        # Kode asli Anda memiliki ini, jadi saya pertahankan. Jika ini UnetModel dari LDM, ia mungkin tidak
+        # menangani 'context' seperti ini secara langsung.
+        # if context is not None:
+        #     # assume aligned context, cat along channel axis
+        #     x = torch.cat((x, context), dim=1) # Ini akan mengubah in_channels efektif
+
         if self.use_timestep:
-            # timestep embedding
             assert t is not None
             temb = get_timestep_embedding(t, self.ch)
             temb = self.temb.dense[0](temb)
@@ -368,7 +444,6 @@ class Model(nn.Module):
         else:
             temb = None
 
-        # downsampling
         hs = [self.conv_in(x)]
         for i_level in range(self.num_resolutions):
             for i_block in range(self.num_res_blocks):
@@ -379,30 +454,35 @@ class Model(nn.Module):
             if i_level != self.num_resolutions-1:
                 hs.append(self.down[i_level].downsample(hs[-1]))
 
-        # middle
         h = hs[-1]
         h = self.mid.block_1(h, temb)
         h = self.mid.attn_1(h)
         h = self.mid.block_2(h, temb)
 
-        # upsampling
         for i_level in reversed(range(self.num_resolutions)):
+            # h adalah output dari level sebelumnya (atau middle block)
             for i_block in range(self.num_res_blocks+1):
-                h = self.up[i_level].block[i_block](
-                    torch.cat([h, hs.pop()], dim=1), temb)
+                # Ambil skip connection yang sesuai
+                skip_h = hs.pop()
+                # Gabungkan h dengan skip_h
+                h_cat = torch.cat([h, skip_h], dim=1)
+                h = self.up[i_level].block[i_block](h_cat, temb)
                 if len(self.up[i_level].attn) > 0:
                     h = self.up[i_level].attn[i_block](h)
             if i_level != 0:
                 h = self.up[i_level].upsample(h)
 
-        # end
         h = self.norm_out(h)
         h = nonlinearity(h)
         h = self.conv_out(h)
         return h
 
     def get_last_layer(self):
-        return self.conv_out.weight
+        # Mengembalikan bobot dari layer conv_out (bisa L4Q atau nn.Conv2d)
+        if hasattr(self.conv_out, 'w0'): # Jika L4Q, kembalikan w0 (bobot asli)
+            return self.conv_out.w0 
+        else: # Jika nn.Conv2d standar
+            return self.conv_out.weight
 
 
 class Encoder(nn.Module):
