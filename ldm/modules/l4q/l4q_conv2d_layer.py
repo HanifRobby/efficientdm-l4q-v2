@@ -9,6 +9,7 @@ from .l4q_quant_core import l4q_init_scale, get_quantization_bounds
 GRADCHECK_DTYPE = torch.double
 
 def check_tensor_grad(grad_tensor, name="gradient", expected_dtype=GRADCHECK_DTYPE):
+    # ... (definisi check_tensor_grad tetap sama) ...
     if grad_tensor is None:
         print(f"  DEBUG GRAD: {name}: None (OK)")
         return True
@@ -62,36 +63,47 @@ class L4QQuantizedConv2dFunction(torch.autograd.Function):
         if effective_qgs_fwd == -1: 
             w_scaled = w_comb / (q_scale + 1e-9) if q_scale.numel() > 1 else w_comb / (q_scale.item() + 1e-9)
 
+        clamped_w_scaled_grouped = None # Inisialisasi
+        clamped_w_scaled = None       # Inisialisasi
+
         if effective_qgs_fwd != -1:
-            quantized_w_int_grouped = torch.round(torch.clamp(w_scaled_grouped, q_n, q_p))
+            clamped_w_scaled_grouped = torch.clamp(w_scaled_grouped, q_n, q_p)
+            quantized_w_int_grouped = torch.round(clamped_w_scaled_grouped)
             w_q_grouped = quantized_w_int_grouped * scale_expanded
             w_q = w_q_grouped.reshape(original_shape)
-            w_scaled_for_ste = w_scaled_grouped
+            w_input_to_round_for_grad_s = clamped_w_scaled_grouped
             quantized_w_int_for_backward = quantized_w_int_grouped
         else: 
-            quantized_w_int = torch.round(torch.clamp(w_scaled, q_n, q_p))
+            clamped_w_scaled = torch.clamp(w_scaled, q_n, q_p)
+            quantized_w_int = torch.round(clamped_w_scaled)
             w_q = quantized_w_int * (q_scale if q_scale.numel() > 1 else q_scale.item())
-            w_scaled_for_ste = w_scaled
+            w_input_to_round_for_grad_s = clamped_w_scaled
             quantized_w_int_for_backward = quantized_w_int
             
         output = F.conv2d(x, w_q, bias, stride, padding, dilation, groups)
 
-        ctx.save_for_backward(x, w0, lora_a, lora_b, bias, q_scale, w_q, quantized_w_int_for_backward, w_comb, delta_w)
+        # Simpan w_input_to_round_for_grad_s
+        ctx.save_for_backward(x, w0, lora_a, lora_b, bias, q_scale, w_q, 
+                              quantized_w_int_for_backward, w_comb, delta_w, w_input_to_round_for_grad_s)
         ctx.alpha = alpha
         ctx.q_n, ctx.q_p = q_n, q_p
         ctx.stride, ctx.padding, ctx.dilation, ctx.groups = stride, padding, dilation, groups
-        ctx.w_scaled_for_ste = w_scaled_for_ste
+        # w_scaled_for_ste_clamp adalah input ke clamp (W_comb/s)
+        if effective_qgs_fwd != -1:
+            ctx.w_scaled_for_ste_clamp = w_scaled_grouped 
+        else:
+            ctx.w_scaled_for_ste_clamp = w_scaled
         ctx.effective_quant_group_size_used_in_fwd = effective_qgs_fwd
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
-        x, w0, lora_a, lora_b, bias, q_scale, w_q, quantized_w_int, w_comb, delta_w = ctx.saved_tensors
+        x, w0, lora_a, lora_b, bias, q_scale, w_q, quantized_w_int, w_comb, delta_w, w_input_to_round_for_grad_s = ctx.saved_tensors
         alpha = ctx.alpha
         effective_qgs = ctx.effective_quant_group_size_used_in_fwd
         q_n, q_p = ctx.q_n, ctx.q_p
         stride, padding, dilation, groups = ctx.stride, ctx.padding, ctx.dilation, ctx.groups
-        w_scaled_for_ste = ctx.w_scaled_for_ste
+        w_scaled_for_ste_clamp = ctx.w_scaled_for_ste_clamp
 
         grad_x = grad_w0 = grad_lora_a = grad_lora_b = grad_bias = grad_q_scale = None
         
@@ -104,10 +116,10 @@ class L4QQuantizedConv2dFunction(torch.autograd.Function):
         grad_L_wrt_wq = grad_L_wrt_wq_intermediate.to(w_q.dtype)
         
         if effective_qgs != -1:
-            ste_mask_grouped = (w_scaled_for_ste >= q_n) & (w_scaled_for_ste <= q_p)
+            ste_mask_grouped = (w_scaled_for_ste_clamp >= q_n) & (w_scaled_for_ste_clamp <= q_p)
             ste_mask = ste_mask_grouped.reshape(w_comb.shape)
         else:
-            ste_mask = (w_scaled_for_ste >= q_n) & (w_scaled_for_ste <= q_p)
+            ste_mask = (w_scaled_for_ste_clamp >= q_n) & (w_scaled_for_ste_clamp <= q_p)
         
         grad_L_wrt_wq_masked_by_ste = grad_L_wrt_wq * ste_mask.to(grad_L_wrt_wq.dtype)
         grad_L_wrt_delta_w = alpha * grad_L_wrt_wq_masked_by_ste
@@ -120,17 +132,24 @@ class L4QQuantizedConv2dFunction(torch.autograd.Function):
         
         if ctx.needs_input_grad[7]: # q_scale
             quantized_w_int_casted = quantized_w_int.to(grad_L_wrt_wq.dtype)
+            w_input_to_round_casted = w_input_to_round_for_grad_s.to(grad_L_wrt_wq.dtype)
+            
+            # Menggunakan formula LSQ+: dWq/ds = (quantized_w_int - w_input_to_round)
+            grad_s_elementwise = quantized_w_int_casted - w_input_to_round_casted
+
             if effective_qgs != -1:
                 num_quant_groups = w_comb.numel() // effective_qgs
                 grad_L_wrt_wq_grouped = grad_L_wrt_wq.reshape(num_quant_groups, effective_qgs)
-                grad_q_scale_grouped = (grad_L_wrt_wq_grouped * quantized_w_int_casted).sum(dim=1)
+                # grad_s_elementwise juga perlu di-reshape jika asalnya dari w_comb
+                grad_s_elementwise_grouped = grad_s_elementwise # Sudah grouped karena w_input_to_round_for_grad_s grouped
+                
+                grad_q_scale_grouped = (grad_L_wrt_wq_grouped * grad_s_elementwise_grouped).sum(dim=1)
                 grad_q_scale = grad_q_scale_grouped.to(q_scale.dtype)
             else: # Per-tensor
-                grad_q_scale_sum = (grad_L_wrt_wq * quantized_w_int_casted).sum()
-                # Pastikan grad_q_scale memiliki shape yang sama dengan q_scale input
-                if q_scale.numel() == 1 and q_scale.ndim == 1: # Jika q_scale adalah [1]
+                grad_q_scale_sum = (grad_L_wrt_wq * grad_s_elementwise).sum()
+                if q_scale.numel() == 1 and q_scale.ndim == 1: 
                     grad_q_scale = grad_q_scale_sum.reshape(1).to(q_scale.dtype)
-                elif q_scale.numel() == 1 and q_scale.ndim == 0: # Jika q_scale adalah skalar
+                elif q_scale.numel() == 1 and q_scale.ndim == 0: 
                      grad_q_scale = grad_q_scale_sum.to(q_scale.dtype)
                 else:
                     grad_q_scale = grad_q_scale_sum.to(q_scale.dtype)
